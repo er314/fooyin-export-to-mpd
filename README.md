@@ -13,6 +13,8 @@ This is a plugin for [fooyin](https://github.com/fooyin/fooyin).
 
 ![Screenshot](README-screenshot.jpg)
 
+In addition, for convenience, the plugin also adds 3 more buttons for quickly controlling playback of MPD queue (starting with plugin version 0.2.0) : Previous track, Play/Pause, Next track
+
 ## Pre-requisites
 
 - Fooyin

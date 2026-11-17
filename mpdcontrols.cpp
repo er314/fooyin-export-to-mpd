@@ -16,9 +16,188 @@
 #include <QPushButton>
 #include <QtConcurrent/QtConcurrentRun>
 
+#include <QAction>
+#include <QActionGroup>
+#include <QMenu>
+#include <QStyle>
+#include <QToolButton>
+#include <QSettings>
+
+#include <algorithm>
+
 #include <mpd/client.h>
 
 namespace {
+
+QString mpdError(mpd_connection* connection)
+{
+    const char* message = mpd_connection_get_error_message(connection);
+    return message ? QString::fromUtf8(message)
+                   : QStringLiteral("Unknown MPD error");
+}
+
+QList<MpdAudioOutput> readMpdOutputs(
+    mpd_connection* connection,
+    QString* error)
+{
+    QList<MpdAudioOutput> result;
+
+    if (!mpd_send_outputs(connection)) {
+        *error = mpdError(connection);
+        return result;
+    }
+
+    while (auto* output = mpd_recv_output(connection)) {
+        const char* name = mpd_output_get_name(output);
+        const char* plugin = mpd_output_get_plugin(output);
+
+        result.append({
+            mpd_output_get_id(output),
+            name ? QString::fromUtf8(name) : QString{},
+            plugin ? QString::fromUtf8(plugin) : QString{},
+            mpd_output_get_enabled(output)
+        });
+
+        mpd_output_free(output);
+    }
+
+    if (!mpd_response_finish(connection)) {
+        *error = mpdError(connection);
+        result.clear();
+        return result;
+    }
+
+    // Keep MPD's original order within each category, but put ALSA outputs
+    // after other plugins and HTTPD outputs after ALSA outputs.
+    const auto outputPriority = [](const MpdAudioOutput& output) {
+        if (output.plugin == QStringLiteral("httpd")) {
+            return 2;
+        }
+        if (output.plugin == QStringLiteral("alsa")) {
+            return 1;
+        }
+        return 0;
+    };
+
+    std::stable_sort(
+        result.begin(), result.end(),
+        [&outputPriority](const MpdAudioOutput& lhs,
+                          const MpdAudioOutput& rhs) {
+            return outputPriority(lhs) < outputPriority(rhs);
+        });
+
+    return result;
+}
+
+void restoreOrChooseOutput(const QList<MpdAudioOutput>& outputs,
+                           int* selectedOutputId,
+                           QString* selectedOutputName,
+                           QString* selectedOutputPlugin)
+{
+    if (outputs.isEmpty()) {
+        // Keep the saved name/plugin so the selection can be restored if
+        // outputs become available again later.
+        *selectedOutputId = -1;
+    } else {
+        auto selected = outputs.cend();
+
+        // Prefer the saved plugin/name identity. MPD output IDs can change
+        // when the server configuration is edited or outputs are recreated.
+        if (!selectedOutputName->isEmpty() || !selectedOutputPlugin->isEmpty()) {
+            selected = std::find_if(
+                outputs.cbegin(), outputs.cend(),
+                [selectedOutputId, selectedOutputName, selectedOutputPlugin](
+                    const MpdAudioOutput& output) {
+                    return static_cast<int>(output.id) == *selectedOutputId
+                           && output.name == *selectedOutputName
+                           && output.plugin == *selectedOutputPlugin;
+                });
+
+            if (selected == outputs.cend()) {
+                selected = std::find_if(
+                    outputs.cbegin(), outputs.cend(),
+                    [selectedOutputName, selectedOutputPlugin](
+                        const MpdAudioOutput& output) {
+                        return output.name == *selectedOutputName
+                               && output.plugin == *selectedOutputPlugin;
+                    });
+            }
+        } else {
+            selected = std::find_if(
+                outputs.cbegin(), outputs.cend(),
+                [selectedOutputId](const MpdAudioOutput& output) {
+                    return static_cast<int>(output.id) == *selectedOutputId;
+                });
+        }
+
+        if (selected == outputs.cend()) {
+            selected = outputs.cbegin();
+        }
+
+        *selectedOutputId = static_cast<int>(selected->id);
+        *selectedOutputName = selected->name;
+        *selectedOutputPlugin = selected->plugin;
+    }
+
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("MpdControls"));
+    settings.setValue(QStringLiteral("selectedOutputId"), *selectedOutputId);
+    settings.setValue(QStringLiteral("selectedOutputName"), *selectedOutputName);
+    settings.setValue(QStringLiteral("selectedOutputPlugin"), *selectedOutputPlugin);
+    settings.endGroup();
+}
+
+bool enableSelectedOutput(
+    mpd_connection* connection,
+    int* selectedOutputId,
+    QString* selectedOutputName,
+    QString* selectedOutputPlugin,
+    QString* error)
+{
+    const auto outputs = readMpdOutputs(connection, error);
+
+    if (!error->isEmpty()) {
+        return false;
+    }
+
+    if (outputs.isEmpty()) {
+        *error = QStringLiteral("MPD has no available audio outputs");
+        return false;
+    }
+
+    restoreOrChooseOutput(
+        outputs, selectedOutputId, selectedOutputName, selectedOutputPlugin);
+
+    // Disable all other outputs.
+    for (const auto& output : outputs) {
+        if (static_cast<int>(output.id) == *selectedOutputId) {
+            continue;
+        }
+
+        if (output.enabled
+            && !mpd_run_disable_output(connection, output.id)) {
+            *error = mpdError(connection);
+            return false;
+        }
+    }
+
+    // Enable the selected output.
+    const auto selectedOutput = std::find_if(
+        outputs.cbegin(),
+        outputs.cend(),
+        [selectedOutputId](const MpdAudioOutput& output) {
+            return static_cast<int>(output.id) == *selectedOutputId;
+        });
+
+    if (selectedOutput != outputs.cend() && !selectedOutput->enabled) {
+        if (!mpd_run_enable_output(connection, selectedOutput->id)) {
+            *error = mpdError(connection);
+            return false;
+        }
+    }
+
+    return true;
+}
 
 struct MpdConfig
 {
@@ -44,11 +223,40 @@ MpdConfig readMpdConfig()
     return config;
 }
 
-QString mpdError(mpd_connection* connection)
+mpd_connection* openMpdConnection(QString* error)
 {
-    const char* message = mpd_connection_get_error_message(connection);
-    return message ? QString::fromUtf8(message)
-                   : QStringLiteral("Unknown MPD error");
+    const MpdConfig config = readMpdConfig();
+    const QByteArray host = config.host.toUtf8();
+
+    auto* connection =
+        mpd_connection_new(host.constData(), config.port, 5000);
+
+    if (!connection) {
+        *error = QStringLiteral("Could not allocate an MPD connection");
+        return nullptr;
+    }
+
+    if (mpd_connection_get_error(connection) != MPD_ERROR_SUCCESS) {
+        *error = QStringLiteral("MPD connection failed: %1")
+                     .arg(mpdError(connection));
+
+        mpd_connection_free(connection);
+        return nullptr;
+    }
+
+    if (!config.password.isEmpty()) {
+        const QByteArray password = config.password.toUtf8();
+
+        if (!mpd_run_password(connection, password.constData())) {
+            *error = QStringLiteral("MPD authentication failed: %1")
+                         .arg(mpdError(connection));
+
+            mpd_connection_free(connection);
+            return nullptr;
+        }
+    }
+
+    return connection;
 }
 
 QStringList makeMpdUris(const Fooyin::TrackList& tracks,
@@ -203,7 +411,14 @@ QString runMpdOperation(const QStringList& uris,
 
 MpdControls::MpdControls(QObject* parent)
     : QObject{parent}
-{}
+{
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("MpdControls"));
+    m_selectedOutputId = settings.value(QStringLiteral("selectedOutputId"), -1).toInt();
+    m_selectedOutputName = settings.value(QStringLiteral("selectedOutputName")).toString();
+    m_selectedOutputPlugin = settings.value(QStringLiteral("selectedOutputPlugin")).toString();
+    settings.endGroup();
+}
 
 void MpdControls::setFooyinServices(Fooyin::MusicLibrary* library)
 {
@@ -216,6 +431,193 @@ void MpdControls::setGuiServices(
 {
     m_playlistSelection = playlistSelection;
     m_trackSelection = trackSelection;
+}
+
+void MpdControls::previous()
+{
+    QString error;
+    auto* connection = openMpdConnection(&error);
+
+    if (!connection) {
+        emit statusChanged(error);
+        return;
+    }
+
+    const bool ok = mpd_run_previous(connection);
+    if (!ok) {
+        error = mpdError(connection);
+    }
+
+    mpd_connection_free(connection);
+
+    if (!ok) {
+        emit statusChanged(error);
+        return;
+    }
+
+    // MPD resumes playback when navigating to another track.
+    // m_pauseMode represents the active-playback UI mode: true means
+    // playback is active and the button must display the Pause icon.
+    m_pauseMode = true;
+    emit playbackModeChanged(true);
+}
+
+void MpdControls::next()
+{
+    QString error;
+    auto* connection = openMpdConnection(&error);
+
+    if (!connection) {
+        emit statusChanged(error);
+        return;
+    }
+
+    const bool ok = mpd_run_next(connection);
+    if (!ok) {
+        error = mpdError(connection);
+    }
+
+    mpd_connection_free(connection);
+
+    if (!ok) {
+        emit statusChanged(error);
+        return;
+    }
+
+    // MPD resumes playback when navigating to another track.
+    // m_pauseMode represents the active-playback UI mode: true means
+    // playback is active and the button must display the Pause icon.
+    m_pauseMode = true;
+    emit playbackModeChanged(true);
+}
+
+void MpdControls::stopPlayback()
+{
+    QString error;
+    auto* connection = openMpdConnection(&error);
+
+    if (!connection) {
+        emit statusChanged(error);
+        return;
+    }
+
+    const bool ok = mpd_run_stop(connection);
+    if (!ok) {
+        error = mpdError(connection);
+    }
+
+    mpd_connection_free(connection);
+
+    if (!ok) {
+        emit statusChanged(error);
+        return;
+    }
+
+    if (m_pauseMode) {
+        m_pauseMode = false;
+        emit playbackModeChanged(false);
+    }
+}
+
+void MpdControls::togglePlayback()
+{
+    QString error;
+    auto* connection = openMpdConnection(&error);
+
+    if (!connection) {
+        emit statusChanged(error);
+        return;
+    }
+
+    bool ok = true;
+
+    if (!m_pauseMode) {
+        // PLAY mode: configure the selected output first.
+        ok = enableSelectedOutput(
+            connection,
+            &m_selectedOutputId,
+            &m_selectedOutputName,
+            &m_selectedOutputPlugin,
+            &error);
+
+        if (ok) {
+            ok = mpd_run_play(connection);
+
+            if (!ok) {
+                error = mpdError(connection);
+            }
+        }
+    } else {
+        // PAUSE mode: explicitly enforce pause.
+        ok = mpd_run_pause(connection, true);
+
+        if (!ok) {
+            error = mpdError(connection);
+        }
+    }
+
+    mpd_connection_free(connection);
+
+    if (!ok) {
+        emit statusChanged(error);
+        return;
+    }
+
+    // Change the UI mode only after the MPD command succeeds.
+    m_pauseMode = !m_pauseMode;
+    emit playbackModeChanged(m_pauseMode);
+}
+
+QList<MpdAudioOutput> MpdControls::availableOutputs(QString* error)
+{
+    if (error) {
+        error->clear();
+    }
+
+    QString localError;
+    auto* connection = openMpdConnection(&localError);
+
+    if (!connection) {
+        if (error) {
+            *error = localError;
+        }
+        return {};
+    }
+
+    const auto outputs = readMpdOutputs(connection, &localError);
+    mpd_connection_free(connection);
+
+    if (!localError.isEmpty()) {
+        if (error) {
+            *error = localError;
+        }
+        return {};
+    }
+
+    // Restore the previous choice, or choose and persist the first output.
+    // The reordered list means non-ALSA outputs come first, then ALSA,
+    // with HTTPD outputs at the very end.
+    restoreOrChooseOutput(
+        outputs, &m_selectedOutputId,
+        &m_selectedOutputName, &m_selectedOutputPlugin);
+
+    return outputs;
+}
+
+void MpdControls::selectOutput(const MpdAudioOutput& output)
+{
+    // Remember the selection only. The MPD output configuration is changed
+    // when playback is started.
+    m_selectedOutputId = static_cast<int>(output.id);
+    m_selectedOutputName = output.name;
+    m_selectedOutputPlugin = output.plugin;
+
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("MpdControls"));
+    settings.setValue(QStringLiteral("selectedOutputId"), m_selectedOutputId);
+    settings.setValue(QStringLiteral("selectedOutputName"), m_selectedOutputName);
+    settings.setValue(QStringLiteral("selectedOutputPlugin"), m_selectedOutputPlugin);
+    settings.endGroup();
 }
 
 bool MpdControls::tracksForCurrentPlaylist(Fooyin::TrackList* tracks,
@@ -309,23 +711,65 @@ void MpdControls::addTracks(const Fooyin::TrackList& tracks,
         }));
 }
 
+
 MpdControlsWidget::MpdControlsWidget(MpdControls* controls, QWidget* parent)
     : FyWidget{parent}
     , m_controls{controls}
     , m_queueButton{new QPushButton(tr("MPD queue add"), this)}
     , m_playlistButton{new QPushButton(tr("MPD playlist add"), this)}
     , m_clearCheckBox{new QCheckBox(tr("MPD clear"), this)}
+    , m_previousButton{new QToolButton(this)}
+    , m_playPauseButton{new QToolButton(this)}
+    , m_nextButton{new QToolButton(this)}
 {
     auto* layout = new QHBoxLayout(this);
+
     layout->setContentsMargins(0, 0, 0, 0);
+
+    // Existing export controls.
     layout->addWidget(m_queueButton);
     layout->addWidget(m_playlistButton);
     layout->addWidget(m_clearCheckBox);
 
     m_clearCheckBox->setChecked(false);
 
+    // Separate the export controls from playback controls.
+    layout->addSpacing(8);
+
+    // Playback buttons.
+    m_previousButton->setIcon(
+        style()->standardIcon(QStyle::SP_MediaSkipBackward));
+
+    m_playPauseButton->setIcon(
+        style()->standardIcon(QStyle::SP_MediaPlay));
+
+    m_nextButton->setIcon(
+        style()->standardIcon(QStyle::SP_MediaSkipForward));
+
+    for (auto* button : {
+             m_previousButton,
+             m_playPauseButton,
+             m_nextButton
+         }) {
+        button->setAutoRaise(true);
+        button->setToolButtonStyle(Qt::ToolButtonIconOnly);
+        button->setIconSize(QSize(18, 18));
+        button->setFixedSize(28, 28);
+
+        layout->addWidget(button);
+    }
+
+    // Play/Pause right-click behaviour.
+    m_playPauseButton->setToolTip(
+        tr("Right-click to select MPD audio output"));
+
+    m_playPauseButton->setContextMenuPolicy(
+        Qt::CustomContextMenu);
+
+    // Existing export connections.
     connect(m_queueButton, &QPushButton::clicked, this,
             [this]() { add(false); });
+
     connect(m_playlistButton, &QPushButton::clicked, this,
             [this]() { add(true); });
 
@@ -337,6 +781,80 @@ MpdControlsWidget::MpdControlsWidget(MpdControls* controls, QWidget* parent)
 
     connect(m_controls, &MpdControls::statusChanged,
             this, &MpdControlsWidget::showResult);
+
+    // New playback connections.
+    connect(m_previousButton, &QToolButton::clicked,
+            m_controls, &MpdControls::previous);
+
+    connect(m_playPauseButton, &QToolButton::clicked,
+            m_controls, &MpdControls::togglePlayback);
+
+    connect(m_nextButton, &QToolButton::clicked,
+            m_controls, &MpdControls::next);
+
+    connect(m_controls, &MpdControls::playbackModeChanged,
+            this, [this](bool pauseMode) {
+                m_playPauseButton->setIcon(
+                    style()->standardIcon(
+                        pauseMode
+                            ? QStyle::SP_MediaPause
+                            : QStyle::SP_MediaPlay));
+            });
+
+    connect(m_playPauseButton,
+            &QToolButton::customContextMenuRequested,
+            this,
+            &MpdControlsWidget::showOutputMenu);
+}
+
+
+void MpdControlsWidget::showOutputMenu(const QPoint& pos)
+{
+    QMenu menu(this);
+
+    // This command is deliberately independent of output discovery, so it
+    // remains available even if MPD cannot return its output list.
+    QAction* stopAction = menu.addAction(tr("Stop playback"));
+    connect(stopAction, &QAction::triggered,
+            m_controls, &MpdControls::stopPlayback);
+
+    menu.addSeparator();
+
+    QString error;
+    const auto outputs = m_controls->availableOutputs(&error);
+
+    if (!error.isEmpty()) {
+        QAction* unavailableAction = menu.addAction(
+            tr("Audio outputs unavailable"));
+        unavailableAction->setEnabled(false);
+    } else if (outputs.isEmpty()) {
+        QAction* emptyAction = menu.addAction(
+            tr("No MPD audio outputs available"));
+        emptyAction->setEnabled(false);
+    } else {
+        QActionGroup group(&menu);
+        group.setExclusive(true);
+
+        for (const auto& output : outputs) {
+            QAction* action = menu.addAction(output.name);
+            action->setCheckable(true);
+            action->setData(output.id);
+            group.addAction(action);
+            action->setChecked(
+                static_cast<int>(output.id) == m_controls->selectedOutputId());
+
+            connect(action, &QAction::triggered,
+                    this, [this, output]() {
+                        m_controls->selectOutput(output);
+                    });
+        }
+    }
+
+    menu.exec(m_playPauseButton->mapToGlobal(pos));
+
+    if (!error.isEmpty()) {
+        showResult(error);
+    }
 }
 
 void MpdControlsWidget::add(bool toStoredPlaylist)
@@ -349,7 +867,7 @@ void MpdControlsWidget::add(bool toStoredPlaylist)
         return;
     }
 
-    if (tracks.size() > 100) {
+    if (tracks.size() > 50) {
         const QString destination = toStoredPlaylist
             ? tr("the MPD playlist “Filtered playlist”")
             : tr("the MPD queue");
